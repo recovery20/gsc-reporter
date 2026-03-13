@@ -1,37 +1,40 @@
 #!/usr/bin/env python3
 """
 GSC Weekly Swing Reporter → Email (Outlook / Microsoft 365)
-Uses the Anthropic API (with GSC MCP connector) to pull Search Console data,
+Uses a Google Service Account to pull Search Console data directly,
 detect week-over-week swings, and send a formatted HTML email.
 
 Requirements:
-    pip install anthropic
+    pip install google-auth google-auth-httplib2 google-api-python-client
 
 Environment variables:
-    ANTHROPIC_API_KEY   - Your Anthropic API key (sk-ant-...)
-    EMAIL_ADDRESS       - Your Outlook email address (you@yourdomain.com)
-    EMAIL_PASSWORD      - Your Outlook password or App Password
-    SWING_THRESHOLD     - Min % change to flag, default 0.20 (20%)
-    TOP_N               - Max pages per property in email, default 5
+    GSC_SERVICE_ACCOUNT_JSON  - Full contents of your service account JSON key
+    EMAIL_ADDRESS             - Your Outlook email address
+    EMAIL_PASSWORD            - Your Outlook password or App Password
+    SWING_THRESHOLD           - Min % change to flag, default 0.20 (20%)
+    TOP_N                     - Max pages per property in email, default 5
+    MIN_CLICKS_FILTER         - Ignore pages below this click count, default 5
 """
 
 import os
 import json
 import datetime
 import smtplib
+import tempfile
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-import anthropic
+
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-EMAIL_ADDRESS     = os.environ["EMAIL_ADDRESS"]
-EMAIL_PASSWORD    = os.environ["EMAIL_PASSWORD"]
-SWING_THRESHOLD   = float(os.getenv("SWING_THRESHOLD", "0.20"))
-TOP_N             = int(os.getenv("TOP_N", "5"))
-MIN_CLICKS        = int(os.getenv("MIN_CLICKS_FILTER", "5"))
+EMAIL_ADDRESS   = os.environ["EMAIL_ADDRESS"]
+EMAIL_PASSWORD  = os.environ["EMAIL_PASSWORD"]
+SWING_THRESHOLD = float(os.getenv("SWING_THRESHOLD", "0.20"))
+TOP_N           = int(os.getenv("TOP_N", "5"))
+MIN_CLICKS      = int(os.getenv("MIN_CLICKS_FILTER", "5"))
 
 SMTP_SERVER = "smtp.office365.com"
 SMTP_PORT   = 587
@@ -49,6 +52,8 @@ PROPERTIES = [
     "sc-domain:recoverysalem.com",
     "https://www.ridgefieldrecovery.com/",
 ]
+
+SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"]
 
 # ─────────────────────────────────────────────
 # DATE HELPERS
@@ -69,78 +74,79 @@ def fmt_display(d):
     return d.strftime("%b %d, %Y")
 
 # ─────────────────────────────────────────────
-# FETCH DATA VIA ANTHROPIC + GSC MCP
+# GSC CLIENT
 # ─────────────────────────────────────────────
-def fetch_swing_data(site_url, curr_start, curr_end, prev_start, prev_end):
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+def build_gsc_client():
+    """Build GSC client from JSON key stored in environment variable."""
+    sa_json = os.environ["GSC_SERVICE_ACCOUNT_JSON"]
+    sa_info = json.loads(sa_json)
 
-    prompt = f"""
-You have access to Google Search Console data. Please compare two time periods for this property:
-
-Property: {site_url}
-Current week:  {fmt(curr_start)} to {fmt(curr_end)}
-Previous week: {fmt(prev_start)} to {fmt(prev_end)}
-
-Use the compare_time_periods tool with dimensions=["page"] to get page-level data.
-
-Return ONLY a JSON array of pages that had a swing of {int(SWING_THRESHOLD*100)}% or more
-in clicks, impressions, CTR, or position. Only include pages where at least one week had {MIN_CLICKS}+ clicks.
-
-Format each item exactly like this:
-{{
-  "page": "https://example.com/page",
-  "clicks_curr": 120,
-  "clicks_prev": 80,
-  "impressions_curr": 1500,
-  "impressions_prev": 900,
-  "ctr_curr": 0.08,
-  "ctr_prev": 0.089,
-  "position_curr": 4.2,
-  "position_prev": 6.1
-}}
-
-Return only the raw JSON array, nothing else.
-"""
-
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=4000,
-        mcp_servers=[
-            {
-                "type": "url",
-                "url": "https://gsc.mcp.claude.com/mcp",
-                "name": "search-console-analytics"
-            }
-        ],
-        messages=[{"role": "user", "content": prompt}]
+    creds = service_account.Credentials.from_service_account_info(
+        sa_info, scopes=SCOPES
     )
+    return build("searchconsole", "v1", credentials=creds, cache_discovery=False)
 
-    text = ""
-    for block in response.content:
-        if hasattr(block, "text"):
-            text += block.text
 
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("```")[1]
-        if text.startswith("json"):
-            text = text[4:]
-    text = text.strip()
-
+def fetch_pages(client, site_url, start, end, row_limit=1000):
+    """Fetch page-level data for a given date range."""
+    body = {
+        "startDate": fmt(start),
+        "endDate":   fmt(end),
+        "dimensions": ["page"],
+        "rowLimit": row_limit,
+    }
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        print(f"  Warning: Could not parse JSON for {site_url}")
-        return []
+        resp = client.searchanalytics().query(siteUrl=site_url, body=body).execute()
+        return {row["keys"][0]: row for row in resp.get("rows", [])}
+    except Exception as e:
+        print(f"  Warning: Error fetching {site_url}: {e}")
+        return {}
 
 # ─────────────────────────────────────────────
-# METRIC HELPERS
+# SWING DETECTION
 # ─────────────────────────────────────────────
 def pct_change(prev, curr):
     if prev == 0:
         return None
     return (curr - prev) / prev
 
+def detect_swings(curr_rows, prev_rows):
+    swings = []
+    all_pages = set(curr_rows.keys()) | set(prev_rows.keys())
+
+    for page in all_pages:
+        curr = curr_rows.get(page, {})
+        prev = prev_rows.get(page, {})
+
+        c_clicks = curr.get("clicks", 0)
+        p_clicks = prev.get("clicks", 0)
+
+        if max(c_clicks, p_clicks) < MIN_CLICKS:
+            continue
+
+        triggered = False
+        metrics = {}
+        for metric in ["clicks", "impressions", "ctr", "position"]:
+            c_val = curr.get(metric, 0)
+            p_val = prev.get(metric, 0)
+            pct = pct_change(p_val, c_val)
+            metrics[metric] = {"current": c_val, "previous": p_val, "pct": pct}
+            if pct is not None and abs(pct) >= SWING_THRESHOLD:
+                triggered = True
+
+        if triggered:
+            swings.append({
+                "page": page,
+                "metrics": metrics,
+                "click_delta": c_clicks - p_clicks,
+            })
+
+    swings.sort(key=lambda x: abs(x["click_delta"]), reverse=True)
+    return swings
+
+# ─────────────────────────────────────────────
+# METRIC HELPERS
+# ─────────────────────────────────────────────
 def fmt_val(val, metric):
     if metric == "ctr":
         return f"{val*100:.2f}%"
@@ -156,12 +162,9 @@ def fmt_pct(pct):
     return f"{sign}{pct*100:.1f}%"
 
 def is_positive(pct, metric):
-    """True = good direction (green), False = bad direction (red)."""
     if pct is None:
         return None
-    if metric == "position":
-        return pct < 0   # lower position = better
-    return pct > 0
+    return pct < 0 if metric == "position" else pct > 0
 
 def short_url(url):
     for prefix in ["https://www.", "https://", "http://www.", "http://"]:
@@ -177,8 +180,7 @@ def build_html(all_swings, curr_start, curr_end, prev_start, prev_end):
     total = sum(len(v) for v in all_swings.values())
     threshold_pct = int(SWING_THRESHOLD * 100)
 
-    html = f"""
-<!DOCTYPE html>
+    html = f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
@@ -210,7 +212,7 @@ def build_html(all_swings, curr_start, curr_end, prev_start, prev_end):
 <div class="wrapper">
   <div class="header">
     <h1>📊 Weekly GSC Swing Report</h1>
-    <p>{fmt_display(curr_start)} – {fmt_display(curr_end)} vs {fmt_display(prev_start)} – {fmt_display(prev_end)}</p>
+    <p>{fmt_display(curr_start)} – {fmt_display(curr_end)} &nbsp;vs&nbsp; {fmt_display(prev_start)} – {fmt_display(prev_end)}</p>
   </div>
   <div class="summary">
     <span>Threshold: ±{threshold_pct}%</span>
@@ -219,14 +221,14 @@ def build_html(all_swings, curr_start, curr_end, prev_start, prev_end):
   </div>
 """
 
-    metrics = [
-        ("Clicks",      "clicks_curr",      "clicks_prev",      "clicks"),
-        ("Impressions", "impressions_curr",  "impressions_prev", "impressions"),
-        ("CTR",         "ctr_curr",          "ctr_prev",         "ctr"),
-        ("Position",    "position_curr",     "position_prev",    "position"),
+    metric_cols = [
+        ("Clicks",      "clicks"),
+        ("Impressions", "impressions"),
+        ("CTR",         "ctr"),
+        ("Position",    "position"),
     ]
 
-    for site_url, pages in all_swings.items():
+    for site_url, swings in all_swings.items():
         domain = (site_url
                   .replace("sc-domain:", "")
                   .replace("https://www.", "")
@@ -236,61 +238,49 @@ def build_html(all_swings, curr_start, curr_end, prev_start, prev_end):
         html += f"""
   <div class="property">
     <div class="property-title">🌐 {domain}</div>
-    <div class="date-range">Current: {fmt(curr_start)} to {fmt(curr_end)} &nbsp;|&nbsp; Previous: {fmt(prev_start)} to {fmt(prev_end)}</div>
+    <div class="date-range">
+      Current: {fmt(curr_start)} to {fmt(curr_end)} &nbsp;|&nbsp;
+      Previous: {fmt(prev_start)} to {fmt(prev_end)}
+    </div>
 """
-
-        if not pages:
+        if not swings:
             html += '    <div class="no-swings">✅ No major swings detected this week</div>\n'
         else:
-            sorted_pages = sorted(pages,
-                                  key=lambda p: abs(p.get("clicks_curr", 0) - p.get("clicks_prev", 0)),
-                                  reverse=True)
-
             html += """    <table class="page-table">
       <tr>
-        <th style="width:35%">Page</th>
-        <th>Clicks</th>
-        <th>Impressions</th>
-        <th>CTR</th>
-        <th>Position</th>
+        <th style="width:36%">Page</th>
+        <th>Clicks</th><th>Impressions</th><th>CTR</th><th>Position</th>
       </tr>
 """
-            for page in sorted_pages[:TOP_N]:
-                url = page["page"]
+            for s in swings[:TOP_N]:
+                url = s["page"]
                 html += f'      <tr>\n        <td><a class="page-url" href="{url}">{short_url(url)}</a></td>\n'
-
-                for label, ck, pk, metric in metrics:
-                    curr_val = page.get(ck, 0)
-                    prev_val = page.get(pk, 0)
-                    pct = pct_change(prev_val, curr_val)
-                    pct_str = fmt_pct(pct)
+                for label, metric in metric_cols:
+                    m = s["metrics"][metric]
+                    pct = m["pct"]
                     good = is_positive(pct, metric)
                     css = "up" if good else ("down" if good is False else "neutral")
                     arrow = "▲" if (pct or 0) > 0 else ("▼" if (pct or 0) < 0 else "–")
                     html += (
                         f'        <td>'
-                        f'{fmt_val(prev_val, metric)} → <strong>{fmt_val(curr_val, metric)}</strong><br>'
-                        f'<span class="{css}">{arrow} {pct_str}</span>'
+                        f'{fmt_val(m["previous"], metric)} → <strong>{fmt_val(m["current"], metric)}</strong><br>'
+                        f'<span class="{css}">{arrow} {fmt_pct(pct)}</span>'
                         f'</td>\n'
                     )
-
                 html += "      </tr>\n"
-
             html += "    </table>\n"
 
-            if len(pages) > TOP_N:
-                remaining = len(pages) - TOP_N
-                html += f'    <div class="more">...and {remaining} more pages with swings</div>\n'
+            if len(swings) > TOP_N:
+                html += f'    <div class="more">...and {len(swings) - TOP_N} more pages with swings</div>\n'
 
         html += "  </div>\n"
 
     html += """  <div class="footer">
-    Generated automatically by GSC Weekly Swing Reporter &nbsp;•&nbsp; Powered by Anthropic + Google Search Console
+    Generated automatically by GSC Weekly Swing Reporter &nbsp;•&nbsp; Powered by Google Search Console API
   </div>
 </div>
 </body>
-</html>
-"""
+</html>"""
     return html
 
 # ─────────────────────────────────────────────
@@ -298,7 +288,6 @@ def build_html(all_swings, curr_start, curr_end, prev_start, prev_end):
 # ─────────────────────────────────────────────
 def send_email(html, curr_start, curr_end):
     subject = f"📊 GSC Weekly Swing Report — {fmt_display(curr_start)} to {fmt_display(curr_end)}"
-
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"]    = EMAIL_ADDRESS
@@ -310,7 +299,6 @@ def send_email(html, curr_start, curr_end):
         server.starttls()
         server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
         server.sendmail(EMAIL_ADDRESS, EMAIL_ADDRESS, msg.as_string())
-
     print(f"✅ Email sent to {EMAIL_ADDRESS}")
 
 # ─────────────────────────────────────────────
@@ -323,12 +311,16 @@ def main():
     print(f"📅 Current week:  {fmt(curr_start)} → {fmt(curr_end)}")
     print(f"📅 Previous week: {fmt(prev_start)} → {fmt(prev_end)}\n")
 
+    client = build_gsc_client()
     all_swings = {}
+
     for site_url in PROPERTIES:
         print(f"Fetching: {site_url}")
-        pages = fetch_swing_data(site_url, curr_start, curr_end, prev_start, prev_end)
-        all_swings[site_url] = pages
-        print(f"  → {len(pages)} pages with major swings")
+        curr_rows = fetch_pages(client, site_url, curr_start, curr_end)
+        prev_rows = fetch_pages(client, site_url, prev_start, prev_end)
+        swings = detect_swings(curr_rows, prev_rows)
+        all_swings[site_url] = swings
+        print(f"  → {len(swings)} pages with major swings")
 
     print("\n📧 Building email...")
     html = build_html(all_swings, curr_start, curr_end, prev_start, prev_end)
