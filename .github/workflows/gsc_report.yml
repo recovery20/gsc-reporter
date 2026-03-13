@@ -1,0 +1,28 @@
+name: GSC Weekly Swing Report
+
+on:
+  schedule:
+    - cron: "0 14 * * 1"  # Every Monday at 9am EST (14:00 UTC)
+  workflow_dispatch:        # Allows manual trigger from GitHub UI
+
+jobs:
+  send-report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install anthropic
+
+      - name: Run GSC Swing Reporter
+        run: python gsc_email_reporter.py
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
